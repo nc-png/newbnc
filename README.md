@@ -8,7 +8,7 @@ The integration is the whole point: ftpbnc opens the connection to glftpd and, b
 IDNT *@<client_ip>:
 ```
 
-(the `*` becomes the ident username when `-i` is on). The field after the IP is the reverse-DNS hostname, left empty here — so the trailing colon is load-bearing: it's what tells glftpd where the (empty) hostname starts, which is the only thing that keeps an IPv6 client address unambiguous, since the address carries its own colons. glftpd has to trust the bouncer's host for this to be accepted — add the ftpbnc machine to your bnc/identd allow list in `glftpd.conf`. If glftpd doesn't trust the source, it ignores IDNT and you get the bouncer IP in the logs, which is the usual "why isn't this working" answer.
+(the `*` becomes the ident username when `-i` is on). The field after the IP is the reverse-DNS hostname, left empty here — so the trailing colon is load-bearing: it's what tells glftpd where the (empty) hostname starts, which is the only thing that keeps an IPv6 client address unambiguous, since the address carries its own colons. glftpd has to trust the bouncer's host for this to be accepted — add the ftpbnc machine to your bnc allow list in `glftpd.conf`. 
 
 ## Build
 
