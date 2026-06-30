@@ -1,0 +1,7 @@
+# Build artifacts
+*.o
+ftpbnc
+genconfig
+
+# Generated launcher scripts (may embed encrypted config)
+script.sh
