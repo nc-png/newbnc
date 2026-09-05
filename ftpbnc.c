@@ -110,6 +110,12 @@ static char g_bind_host[256];
 static char g_bind_port[16];
 static uint16_t g_bind_port_num = 0;
 
+/* Resolved once in main(). getaddrinfo() blocks, so it must never run in the event loop. */
+static struct sockaddr_storage g_dest_addr;
+static socklen_t g_dest_addrlen = 0;
+static struct sockaddr_storage g_bind_addr;   /* port 0: source address for outgoing sockets */
+static socklen_t g_bind_addrlen = 0;
+
 /* Timeouts (milliseconds) */
 static uint64_t g_connect_timeout_ms = 1000;   /* -C, default 1s */
 static uint64_t g_ident_timeout_ms   = 500;    /* -I, default 0.5s */
@@ -167,10 +173,9 @@ update_events_for_conn(struct conn *c)
         if (c->c2s.len > OUTBUF_HIWAT) {
             client_events &= ~EPOLLIN;
         }
-    } else {
-        /* In handshake we don't relay; keeping EPOLLIN is fine but ignored */
-        client_events |= EPOLLIN;
     }
+    /* Handshake: no events. Data waits in the kernel; an armed but ignored
+     * level-triggered event would spin epoll_wait at 100% CPU. */
     if (c->s2c.len > 0) client_events |= EPOLLOUT;
     epoll_update_endpoint(&c->client, client_events);
 
@@ -182,9 +187,9 @@ update_events_for_conn(struct conn *c)
         if (c->s2c.len > OUTBUF_HIWAT) {
             server_events &= ~EPOLLIN;
         }
-    } else {
-        /* During handshake, we need EPOLLOUT/IN for connect completion */
-        server_events |= (EPOLLIN | EPOLLOUT);
+    } else if (!c->server_connected) {
+        /* Handshake: only wait for connect completion; nothing once connected */
+        server_events |= EPOLLOUT;
     }
     if (c->c2s.len > 0) server_events |= EPOLLOUT;
     epoll_update_endpoint(&c->server, server_events);
@@ -547,6 +552,8 @@ static void handle_server_connected(struct conn *c) {
 
     c->server_connected = 1;
     start_relay_if_ready(c);
+    if (!c->closing && c->state == CONN_HANDSHAKE)
+        update_events_for_conn(c);   /* still waiting on ident: disarm the server fd */
 }
 
 /* Write / read handlers */
@@ -724,42 +731,23 @@ static void check_timeouts(void) {
 
 /* Create outgoing socket bound to g_bind_host */
 
-static int create_bound_socket(const struct addrinfo *rp_dest) {
-    struct addrinfo hints_bind, *res_bind = NULL, *rp_bind;
-    memset(&hints_bind, 0, sizeof(hints_bind));
-    hints_bind.ai_socktype = SOCK_STREAM;
-    hints_bind.ai_family   = rp_dest->ai_family;
-    hints_bind.ai_flags    = AI_PASSIVE;
-
-    int ret = getaddrinfo(g_bind_host, NULL, &hints_bind, &res_bind);
-    if (ret != 0) {
-        log_debug("getaddrinfo(bind-local) failed: %s", gai_strerror(ret));
+static int create_bound_socket(int family) {
+    if (family != g_bind_addr.ss_family) {
+        log_debug("bind(local): address family mismatch");
         return -1;
     }
 
-    int sfd = -1;
-    for (rp_bind = res_bind; rp_bind != NULL; rp_bind = rp_bind->ai_next) {
-        if (rp_bind->ai_family != rp_dest->ai_family)
-            continue;
+    int sfd = socket(family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (sfd == -1)
+        return -1;
 
-        sfd = socket(rp_dest->ai_family,
-                     rp_dest->ai_socktype | SOCK_NONBLOCK,
-                     rp_dest->ai_protocol);
-        if (sfd == -1)
-            continue;
+    set_nodelay(sfd);
 
-        set_nodelay(sfd);
-
-        if (bind(sfd, rp_bind->ai_addr, rp_bind->ai_addrlen) < 0) {
-            log_debug("bind(local) failed: %s", strerror(errno));
-            close(sfd);
-            sfd = -1;
-            continue;
-        }
-        break;
+    if (bind(sfd, (const struct sockaddr *)&g_bind_addr, g_bind_addrlen) < 0) {
+        log_debug("bind(local) failed: %s", strerror(errno));
+        close(sfd);
+        return -1;
     }
-
-    freeaddrinfo(res_bind);
     return sfd;
 }
 
@@ -784,6 +772,7 @@ static void conn_start_ident(struct conn *c) {
     memset(&hints, 0, sizeof(hints));
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_family   = AF_UNSPEC;
+    hints.ai_flags    = AI_NUMERICHOST;   /* client_ip is already numeric; never hit DNS */
 
     int ret = getaddrinfo(c->client_ip, "113", &hints, &res);
     if (ret != 0) {
@@ -794,7 +783,7 @@ static void conn_start_ident(struct conn *c) {
 
     int sfd = -1;
     for (rp = res; rp != NULL; rp = rp->ai_next) {
-        sfd = create_bound_socket(rp);
+        sfd = create_bound_socket(rp->ai_family);
         if (sfd == -1)
             continue;
 
@@ -934,36 +923,14 @@ static struct conn *conn_create(int client_fd, const struct sockaddr_storage *ps
         }
     }
 
-    /* Resolve destination */
-    struct addrinfo hints_dest, *res_dest = NULL, *rp_dest;
-    memset(&hints_dest, 0, sizeof(hints_dest));
-    hints_dest.ai_socktype = SOCK_STREAM;
-    hints_dest.ai_family   = AF_UNSPEC;
-
-    int ret = getaddrinfo(g_dest_host, g_dest_port, &hints_dest, &res_dest);
-    if (ret != 0) {
-        log_debug("getaddrinfo(dest) failed: %s", gai_strerror(ret));
-        free(c);
-        return NULL;
+    int sfd = create_bound_socket(g_dest_addr.ss_family);
+    if (sfd != -1 &&
+        connect(sfd, (const struct sockaddr *)&g_dest_addr, g_dest_addrlen) == -1 &&
+        errno != EINPROGRESS) {
+        log_debug("connect(dest) failed immediately: %s", strerror(errno));
+        close(sfd);
+        sfd = -1;
     }
-
-    int sfd = -1;
-    for (rp_dest = res_dest; rp_dest != NULL; rp_dest = rp_dest->ai_next) {
-        sfd = create_bound_socket(rp_dest);
-        if (sfd == -1)
-            continue;
-
-        if (connect(sfd, rp_dest->ai_addr, rp_dest->ai_addrlen) == -1) {
-            if (errno != EINPROGRESS) {
-                log_debug("connect(dest) failed immediately: %s", strerror(errno));
-                close(sfd);
-                sfd = -1;
-                continue;
-            }
-        }
-        break;
-    }
-    freeaddrinfo(res_dest);
 
     if (sfd == -1) {
         free(c);
@@ -975,7 +942,7 @@ static struct conn *conn_create(int client_fd, const struct sockaddr_storage *ps
     struct epoll_event ev;
     memset(&ev, 0, sizeof(ev));
     ev.data.ptr = &c->client;
-    ev.events   = EPOLLIN;
+    ev.events   = 0;   /* handshake: nothing to relay yet; EPOLLERR/HUP still arrive */
     if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, c->client.fd, &ev) < 0) {
         log_debug("epoll add client failed: %s", strerror(errno));
         close(sfd);
@@ -985,7 +952,7 @@ static struct conn *conn_create(int client_fd, const struct sockaddr_storage *ps
 
     memset(&ev, 0, sizeof(ev));
     ev.data.ptr = &c->server;
-    ev.events   = EPOLLOUT | EPOLLIN;
+    ev.events   = EPOLLOUT;   /* connect completion only */
     if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, c->server.fd, &ev) < 0) {
         log_debug("epoll add server failed: %s", strerror(errno));
         epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, c->client.fd, NULL);
@@ -1327,6 +1294,36 @@ int main(int argc, char **argv, char **envp) {
             return 1;
         }
         g_bind_port_num = (uint16_t)port;
+    }
+
+    /* Resolve bind and dest once. A hostname here is looked up at startup only;
+     * a DNS change needs a restart. */
+    {
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_family   = AF_UNSPEC;
+        hints.ai_flags    = AI_PASSIVE;
+
+        int ret = getaddrinfo(g_bind_host, NULL, &hints, &res);
+        if (ret != 0) {
+            fprintf(stderr, "getaddrinfo(bind) failed: %s\n", gai_strerror(ret));
+            return 1;
+        }
+        memcpy(&g_bind_addr, res->ai_addr, res->ai_addrlen);
+        g_bind_addrlen = res->ai_addrlen;
+        freeaddrinfo(res);
+
+        hints.ai_flags  = 0;
+        hints.ai_family = g_bind_addr.ss_family;   /* dest must match bind family */
+        ret = getaddrinfo(g_dest_host, g_dest_port, &hints, &res);
+        if (ret != 0) {
+            fprintf(stderr, "getaddrinfo(dest) failed: %s\n", gai_strerror(ret));
+            return 1;
+        }
+        memcpy(&g_dest_addr, res->ai_addr, res->ai_addrlen);
+        g_dest_addrlen = res->ai_addrlen;
+        freeaddrinfo(res);
     }
 
     if (!g_debug) {
